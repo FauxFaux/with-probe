@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['**']
+
+jobs:
+  release:
+    if: github.event.deleted != true
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: release-${{ github.ref }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      CARGO_TERM_COLOR: always
+      RELEASE_BINARY: target/release/with-probe-amd64
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-auditable
+        run: cargo install cargo-auditable --version 0.7.7 --locked
+
+      - name: Build release binary
+        run: |
+          cargo auditable build --release --locked --bin with-probe
+          mv target/release/with-probe "$RELEASE_BINARY"
+
+      - name: Attest release binary
+        if: ${{ !env.ACT }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.RELEASE_BINARY }}
+
+      - name: Attach binary to draft release
+        if: ${{ !env.ACT }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+            jq -cs --arg tag "$GITHUB_REF_NAME" '[.[][] | select(.tag_name == $tag)] | first // empty')
+
+          if [[ -z "$release" ]]; then
+            gh release create --draft --verify-tag --generate-notes -- "$GITHUB_REF_NAME" "$RELEASE_BINARY"
+            exit 0
+          fi
+
+          if [[ $(jq -r '.draft' <<< "$release") != true ]]; then
+            echo "::error::A published release already exists for $GITHUB_REF_NAME."
+            exit 1
+          fi
+
+          asset=$(jq -c --arg name "${RELEASE_BINARY##*/}" '.assets[] | select(.name == $name)' <<< "$release")
+          if [[ -z "$asset" ]]; then
+            gh release upload -- "$GITHUB_REF_NAME" "$RELEASE_BINARY"
+          else
+            checksum=$(sha256sum "$RELEASE_BINARY")
+            if [[ $(jq -r '.digest' <<< "$asset") != "sha256:${checksum%% *}" ]]; then
+              echo "::error::The draft already has a different ${RELEASE_BINARY##*/}."
+              exit 1
+            fi
+          fi
