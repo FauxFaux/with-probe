@@ -1,28 +1,32 @@
 # with-probe
 
-Run a command under systemd with a Kubernetes-style HTTP liveness probe. The
-wrapper starts the command, checks its health endpoint, and reports readiness
-and liveness through systemd's notification socket.
+Run a command under systemd with HTTP startup and liveness probes. The wrapper
+starts the command, checks its health endpoint, and reports readiness and
+liveness through systemd's notification socket.
 
 ```sh
-with-probe --url http://localhost:8080/healthz --period 5 -- some-other-command --serve
+with-probe --url http://localhost:8080/healthz -- some-other-command --serve
 ```
 
-- `--url` is the endpoint to probe. It must return an HTTP/1.0 `200 OK`.
-- `--period` sets the interval between probe starts in whole seconds. The first
-  probe starts immediately.
-- `--timeout` optionally sets the HTTP request timeout in whole seconds. It
-  defaults to the probe period.
-- Everything after `--` is the child command and its arguments.
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--url HTTP_URL` | Required | Shared endpoint. It must respond with HTTP/1.0 `200 OK`. |
+| `--timeout SECS` | 1 | Request timeout for both probe types. |
+| `--startup-period SECS` | 2 | Interval between startup probe starts. |
+| `--startup-failure-threshold N` | 20 | Consecutive startup failures required to exit. |
+| `--liveness-period SECS` | 5 | Interval between liveness probe starts. |
+| `--liveness-failure-threshold N` | 3 | Consecutive liveness failures required to exit. |
+
+Periods, timeouts, and thresholds are positive whole numbers. Everything after
+`--` is the child command and its arguments.
 
 In your systemd service, use the invocation as `ExecStart`, set `Type=notify`,
-and set `WatchdogSec` to enable the watchdog. The first successful probe triggers
-`READY=1`. The wrapper then sends watchdog notifications at half the watchdog
-interval while the latest successful probe is less than one period plus one
-second old.
+and set `WatchdogSec` to enable the watchdog. The first startup probe starts
+immediately. Its first success triggers `READY=1` and switches to the liveness
+settings. Watchdog notifications continue at half the watchdog interval while
+the liveness failure count stays below its threshold.
 
-A failed probe leaves the last successful probe time unchanged. The startup
-deadline is the longer of the request timeout and one period plus one second.
-If no probe succeeds by that deadline, the last success becomes stale, or a
-notification fails, the wrapper kills the child and exits with status 1. Any
-child exit also fails the wrapper.
+A successful probe clears the accumulated failures. When a threshold is
+reached, the wrapper reports each failure in the streak, kills the child, and
+exits with status 1. Notification failures and child exits also fail the
+wrapper.

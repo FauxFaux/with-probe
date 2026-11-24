@@ -1,7 +1,6 @@
 use std::io;
 use std::process::{Child, Command, ExitCode};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,15 +13,26 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn probe(agent: &ureq::Agent, url: &str) -> bool {
-    agent
+struct ProbeSettings {
+    period: Duration,
+    failure_threshold: usize,
+}
+
+fn probe(agent: &ureq::Agent, url: &str) -> Result<(), String> {
+    let response = agent
         .get(url)
         .version(Version::HTTP_10)
         .header("Connection", "close")
         .call()
-        .is_ok_and(|response| {
-            response.version() == Version::HTTP_10 && response.status() == StatusCode::OK
-        })
+        .map_err(|error| error.to_string())?;
+    if response.version() == Version::HTTP_10 && response.status() == StatusCode::OK {
+        return Ok(());
+    }
+    Err(format!(
+        "expected HTTP/1.0 200 OK, received {:?} {}",
+        response.version(),
+        response.status()
+    ))
 }
 
 fn check_child(child: &mut Child) -> io::Result<()> {
@@ -35,14 +45,15 @@ fn check_child(child: &mut Child) -> io::Result<()> {
 fn supervise(
     child: &mut Child,
     url: String,
-    interval: Duration,
+    startup: ProbeSettings,
+    liveness: ProbeSettings,
     timeout: Duration,
 ) -> io::Result<()> {
-    let clock_start = Instant::now();
-    // Store elapsed milliseconds plus one, with zero reserved for startup.
-    let last_success = Arc::new(AtomicU64::new(0));
-    let heartbeat = Arc::clone(&last_success);
-    let worker = thread::Builder::new().spawn(move || {
+    let watchdog_interval = sd_notify::watchdog_enabled()
+        .filter(|timeout| !timeout.is_zero())
+        .map_or(liveness.period, |timeout| timeout / 2);
+    let (ready, readiness) = mpsc::channel();
+    let worker = thread::Builder::new().spawn(move || -> io::Result<()> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
             .max_idle_connections(0)
@@ -51,62 +62,61 @@ fn supervise(
             .timeout_global(Some(timeout))
             .build()
             .into();
+        let mut settings = &startup;
+        let mut starting = true;
+        let mut failures = Vec::new();
         loop {
             let started = Instant::now();
-            if probe(&agent, &url) {
-                heartbeat.store(
-                    clock_start.elapsed().as_millis() as u64 + 1,
-                    Ordering::Relaxed,
-                );
+            match probe(&agent, &url) {
+                Ok(()) => {
+                    failures.clear();
+                    if starting {
+                        sd_notify::notify(&[NotifyState::Ready, NotifyState::Watchdog])?;
+                        ready.send(Instant::now()).map_err(io::Error::other)?;
+                        starting = false;
+                        settings = &liveness;
+                    }
+                }
+                Err(error) => {
+                    failures.push(error);
+                    if failures.len() == settings.failure_threshold {
+                        let phase = if starting { "startup" } else { "liveness" };
+                        return Err(io::Error::other(format!(
+                            "{phase} probe failed {} times in a row:\n{}",
+                            failures.len(),
+                            failures.join("\n")
+                        )));
+                    }
+                }
             }
-            thread::sleep(interval.saturating_sub(started.elapsed()));
+            thread::sleep(settings.period.saturating_sub(started.elapsed()));
         }
     })?;
 
-    let max_probe_age = interval + Duration::from_secs(1);
-    let startup_timeout = max_probe_age.max(timeout);
-    let watchdog_interval = sd_notify::watchdog_enabled()
-        .filter(|timeout| !timeout.is_zero())
-        .map_or(interval, |timeout| timeout / 2);
-    let mut next_watchdog = Duration::ZERO;
+    let mut next_watchdog: Option<Instant> = None;
     loop {
         check_child(child)?;
-        if worker.is_finished() {
-            return Err(io::Error::other("HTTP probe thread stopped"));
-        }
 
-        let last_success_ms = last_success.load(Ordering::Relaxed);
-        let elapsed = clock_start.elapsed();
-        if last_success_ms == 0 {
-            if elapsed >= startup_timeout {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "no successful HTTP probe before startup deadline",
-                ));
-            }
-            thread::sleep(CHECK_CHILD_INTERVAL.min(startup_timeout - elapsed));
-            continue;
-        }
-
-        let probe_age = elapsed.saturating_sub(Duration::from_millis(last_success_ms - 1));
-        if probe_age >= max_probe_age {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "HTTP probe heartbeat expired",
-            ));
-        }
-
-        if elapsed >= next_watchdog {
-            let states: &[_] = if next_watchdog.is_zero() {
-                &[NotifyState::Ready, NotifyState::Watchdog]
+        let mut wait = CHECK_CHILD_INTERVAL;
+        if let Some(deadline) = next_watchdog {
+            let now = Instant::now();
+            if now >= deadline {
+                sd_notify::notify(&[NotifyState::Watchdog])?;
+                next_watchdog = Some(now + watchdog_interval);
+                wait = wait.min(watchdog_interval);
             } else {
-                &[NotifyState::Watchdog]
-            };
-            sd_notify::notify(states)?;
-            next_watchdog = elapsed + watchdog_interval;
+                wait = wait.min(deadline - now);
+            }
         }
-        let until_watchdog = next_watchdog.saturating_sub(clock_start.elapsed());
-        thread::sleep(CHECK_CHILD_INTERVAL.min(until_watchdog));
+        match readiness.recv_timeout(wait) {
+            Ok(ready_at) => next_watchdog = Some(ready_at + watchdog_interval),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return worker
+                    .join()
+                    .map_err(|_| io::Error::other("HTTP probe thread panicked"))?;
+            }
+        }
     }
 }
 
@@ -120,11 +130,21 @@ fn seconds(value: Option<std::ffi::OsString>) -> io::Result<Duration> {
         })
 }
 
+fn threshold(value: Option<std::ffi::OsString>) -> io::Result<usize> {
+    value
+        .and_then(|arg| arg.to_str()?.parse().ok())
+        .filter(|&count| count > 0)
+        .ok_or_else(|| invalid("failure threshold must be a positive whole number"))
+}
+
 fn run() -> io::Result<()> {
-    const USAGE: &str = "usage: with-probe --url HTTP_URL --period SECONDS [--timeout SECONDS] -- COMMAND [ARG ...]";
+    const USAGE: &str = "usage: with-probe --url HTTP_URL [--timeout SECS] [--startup-period SECS] [--startup-failure-threshold N] [--liveness-period SECS] [--liveness-failure-threshold N] -- COMMAND [ARG ...]";
     let mut args = std::env::args_os().skip(1);
     let mut url = None;
-    let mut period = None;
+    let mut startup_period = None;
+    let mut startup_threshold = None;
+    let mut liveness_period = None;
+    let mut liveness_threshold = None;
     let mut timeout = None;
     loop {
         let flag = args.next().ok_or_else(|| invalid(USAGE))?;
@@ -136,15 +156,33 @@ fn run() -> io::Result<()> {
                         .ok_or_else(|| invalid(USAGE))?,
                 );
             }
-            Some("--period") if period.is_none() => period = Some(seconds(args.next())?),
+            Some("--startup-period") if startup_period.is_none() => {
+                startup_period = Some(seconds(args.next())?);
+            }
+            Some("--startup-failure-threshold") if startup_threshold.is_none() => {
+                startup_threshold = Some(threshold(args.next())?);
+            }
+            Some("--liveness-period") if liveness_period.is_none() => {
+                liveness_period = Some(seconds(args.next())?);
+            }
+            Some("--liveness-failure-threshold") if liveness_threshold.is_none() => {
+                liveness_threshold = Some(threshold(args.next())?);
+            }
             Some("--timeout") if timeout.is_none() => timeout = Some(seconds(args.next())?),
             Some("--") => break,
             _ => return Err(invalid(USAGE)),
         }
     }
     let url = url.ok_or_else(|| invalid(USAGE))?;
-    let period = period.ok_or_else(|| invalid(USAGE))?;
-    let timeout = timeout.unwrap_or(period);
+    let startup = ProbeSettings {
+        period: startup_period.unwrap_or(Duration::from_secs(2)),
+        failure_threshold: startup_threshold.unwrap_or(20),
+    };
+    let liveness = ProbeSettings {
+        period: liveness_period.unwrap_or(Duration::from_secs(5)),
+        failure_threshold: liveness_threshold.unwrap_or(3),
+    };
+    let timeout = timeout.unwrap_or(Duration::from_secs(1));
     let command = args.next().ok_or_else(|| invalid(USAGE))?;
     let mut child = Command::new(&command)
         .args(args)
@@ -153,7 +191,7 @@ fn run() -> io::Result<()> {
         .env_remove("WATCHDOG_USEC")
         .spawn()
         .map_err(|error| io::Error::other(format!("could not start {command:?}: {error}")))?;
-    let result = supervise(&mut child, url, period, timeout);
+    let result = supervise(&mut child, url, startup, liveness, timeout);
     let _ = child.kill();
     let _ = child.wait();
     result
