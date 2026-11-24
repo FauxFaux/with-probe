@@ -122,11 +122,11 @@ fn supervise(
 
 fn seconds(value: Option<std::ffi::OsString>) -> io::Result<Duration> {
     value
-        .and_then(|arg| arg.to_str()?.parse().ok())
-        .map(Duration::from_secs)
+        .and_then(|arg| arg.to_str()?.parse::<f64>().ok())
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
         .filter(|duration| !duration.is_zero() && Instant::now().checked_add(*duration).is_some())
         .ok_or_else(|| {
-            invalid("period and timeout must be positive whole seconds within the clock range")
+            invalid("period and timeout must be positive seconds within the clock range")
         })
 }
 

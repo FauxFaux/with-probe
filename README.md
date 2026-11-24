@@ -17,7 +17,8 @@ with-probe --url http://localhost:8080/healthz -- some-other-command --serve
 | `--liveness-period SECS` | 5 | Interval between liveness probe starts. |
 | `--liveness-failure-threshold N` | 3 | Consecutive liveness failures required to exit. |
 
-Periods, timeouts, and thresholds are positive whole numbers. Everything after
+Periods and timeouts are positive seconds and may include a fractional part.
+Failure thresholds are positive whole numbers. Everything after
 `--` is the child command and its arguments.
 
 In your systemd service, use the invocation as `ExecStart`, set `Type=notify`,
