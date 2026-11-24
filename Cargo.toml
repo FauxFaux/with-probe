@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 sd-notify = "0.5"
+ureq = { version = "3", default-features = false }
 
 [profile.release]
 opt-level = "z"

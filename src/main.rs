@@ -1,117 +1,33 @@
-use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io;
 use std::process::{Child, Command, ExitCode};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sd_notify::NotifyState;
+use ureq::http::{StatusCode, Version};
 
 const CHECK_CHILD_INTERVAL: Duration = Duration::from_millis(20);
-
-struct Endpoint<'a> {
-    authority: &'a str,
-    host: &'a str,
-    port: u16,
-    target: String,
-}
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-impl<'a> Endpoint<'a> {
-    fn parse(url: &'a str) -> io::Result<Self> {
-        let url = url
-            .strip_prefix("http://")
-            .filter(|url| url.bytes().all(|byte| byte.is_ascii_graphic()) && !url.contains('#'))
-            .ok_or_else(|| invalid("expected a plain HTTP URL without a fragment"))?;
-        let (authority, path) = url.split_at(url.find(['/', '?']).unwrap_or(url.len()));
-        let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
-            let (host, suffix) = ipv6
-                .split_once(']')
-                .ok_or_else(|| invalid("missing closing bracket in IPv6 address"))?;
-            host.parse::<std::net::Ipv6Addr>()
-                .map_err(|_| invalid("invalid IPv6 address"))?;
-            (host, suffix)
-        } else {
-            let (host, suffix) = authority.split_at(authority.find(':').unwrap_or(authority.len()));
-            if host.is_empty()
-                || !host
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
-            {
-                return Err(invalid("invalid HTTP URL host"));
-            }
-            (host, suffix)
-        };
-        let port = if port.is_empty() {
-            80
-        } else {
-            port.strip_prefix(':')
-                .and_then(|port| port.parse().ok())
-                .filter(|&port| port != 0)
-                .ok_or_else(|| invalid("invalid HTTP URL port"))?
-        };
-        let target = if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("/{path}")
-        };
-        Ok(Self {
-            authority,
-            host,
-            port,
-            target,
-        })
+fn probe(agent: &ureq::Agent, url: &str) -> io::Result<()> {
+    let response = agent
+        .get(url)
+        .version(Version::HTTP_10)
+        .header("Connection", "close")
+        .call()
+        .map_err(io::Error::other)?;
+    if response.version() == Version::HTTP_10 && response.status() == StatusCode::OK {
+        return Ok(());
     }
-
-    fn probe(&self, deadline: Instant) -> io::Result<()> {
-        let mut last_error = io::Error::other("host resolved to no addresses");
-        for address in (self.host, self.port).to_socket_addrs()? {
-            match TcpStream::connect_timeout(&address, remaining(deadline)?) {
-                Ok(stream) => return self.check_response(stream, deadline),
-                Err(error) => last_error = error,
-            }
-        }
-        Err(last_error)
-    }
-
-    fn check_response(&self, mut stream: TcpStream, deadline: Instant) -> io::Result<()> {
-        let request = format!(
-            "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            self.target, self.authority
-        );
-        let mut pending = request.as_bytes();
-        while !pending.is_empty() {
-            stream.set_write_timeout(Some(remaining(deadline)?))?;
-            let written = stream.write(pending)?;
-            if written == 0 {
-                return Err(io::ErrorKind::WriteZero.into());
-            }
-            pending = &pending[written..];
-        }
-
-        let mut line = [0; 1024];
-        for index in 0..line.len() {
-            stream.set_read_timeout(Some(remaining(deadline)?))?;
-            stream.read_exact(&mut line[index..=index])?;
-            if line[index] == b'\n' {
-                remaining(deadline)?;
-                let status = &line[..=index];
-                if status.strip_suffix(b"\r\n").is_some_and(|status| {
-                    status == b"HTTP/1.0 200" || status.starts_with(b"HTTP/1.0 200 ")
-                }) {
-                    return Ok(());
-                }
-                return Err(io::Error::other(format!(
-                    "unexpected HTTP status line {:?}",
-                    String::from_utf8_lossy(status).trim_end()
-                )));
-            }
-        }
-        Err(io::Error::other("HTTP status line exceeds 1024 bytes"))
-    }
+    Err(io::Error::other(format!(
+        "unexpected HTTP response {:?} {}",
+        response.version(),
+        response.status()
+    )))
 }
 
 fn remaining(deadline: Instant) -> io::Result<Duration> {
@@ -137,9 +53,16 @@ fn supervise(
     let (requests, start) = mpsc::sync_channel(1);
     let (finish, results) = mpsc::sync_channel(1);
     thread::Builder::new().spawn(move || {
-        let endpoint = Endpoint::parse(&url).expect("URL was validated before spawn");
-        for deadline in start {
-            if finish.send(endpoint.probe(deadline)).is_err() {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .max_idle_connections(0)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
+            .build()
+            .into();
+        for () in start {
+            if finish.send(probe(&agent, &url)).is_err() {
                 break;
             }
         }
@@ -152,7 +75,7 @@ fn supervise(
         let deadline = started
             .checked_add(timeout)
             .ok_or_else(|| invalid("probe deadline overflow"))?;
-        requests.send(deadline).map_err(io::Error::other)?;
+        requests.send(()).map_err(io::Error::other)?;
         loop {
             let result = results.recv_timeout(remaining(deadline)?.min(CHECK_CHILD_INTERVAL));
             check_child(child)?;
@@ -217,7 +140,6 @@ fn run() -> io::Result<()> {
         }
     }
     let url = url.ok_or_else(|| invalid(USAGE))?;
-    Endpoint::parse(&url)?;
     let period = period.ok_or_else(|| invalid(USAGE))?;
     let timeout = timeout.unwrap_or(period);
     let command = args.next().ok_or_else(|| invalid(USAGE))?;
