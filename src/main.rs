@@ -1,13 +1,14 @@
 use std::io;
 use std::process::{Child, Command, ExitCode};
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sd_notify::NotifyState;
 use ureq::http::{StatusCode, Version};
 
-const CHECK_CHILD_INTERVAL: Duration = Duration::from_millis(20);
+const CHECK_CHILD_INTERVAL: Duration = Duration::from_millis(50);
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
@@ -30,13 +31,6 @@ fn probe(agent: &ureq::Agent, url: &str) -> io::Result<()> {
     )))
 }
 
-fn remaining(deadline: Instant) -> io::Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|time| !time.is_zero())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP probe timed out"))
-}
-
 fn check_child(child: &mut Child) -> io::Result<()> {
     match child.try_wait()? {
         Some(status) => Err(io::Error::other(format!("child exited with {status}"))),
@@ -50,9 +44,11 @@ fn supervise(
     interval: Duration,
     timeout: Duration,
 ) -> io::Result<()> {
-    let (requests, start) = mpsc::sync_channel(1);
-    let (finish, results) = mpsc::sync_channel(1);
-    thread::Builder::new().spawn(move || {
+    let clock_start = Instant::now();
+    // Store elapsed milliseconds plus one, with zero reserved for startup.
+    let last_success = Arc::new(AtomicU64::new(0));
+    let heartbeat = Arc::clone(&last_success);
+    let worker = thread::Builder::new().spawn(move || -> io::Result<()> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
             .max_idle_connections(0)
@@ -61,49 +57,62 @@ fn supervise(
             .timeout_global(Some(timeout))
             .build()
             .into();
-        for () in start {
-            if finish.send(probe(&agent, &url)).is_err() {
-                break;
-            }
+        loop {
+            let started = Instant::now();
+            probe(&agent, &url)?;
+            heartbeat.store(
+                clock_start.elapsed().as_millis() as u64 + 1,
+                Ordering::Relaxed,
+            );
+            thread::sleep(interval.saturating_sub(started.elapsed()));
         }
     })?;
 
-    let mut ready = false;
+    let max_probe_age = interval + Duration::from_secs(1);
+    let watchdog_interval = sd_notify::watchdog_enabled()
+        .filter(|timeout| !timeout.is_zero())
+        .map_or(interval, |timeout| timeout / 2);
+    let mut next_watchdog = Duration::ZERO;
     loop {
         check_child(child)?;
-        let started = Instant::now();
-        let deadline = started
-            .checked_add(timeout)
-            .ok_or_else(|| invalid("probe deadline overflow"))?;
-        requests.send(()).map_err(io::Error::other)?;
-        loop {
-            let result = results.recv_timeout(remaining(deadline)?.min(CHECK_CHILD_INTERVAL));
-            check_child(child)?;
-            match result {
-                Ok(result) => {
-                    remaining(deadline)?;
-                    result?;
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(error) => return Err(io::Error::other(error)),
+        if worker.is_finished() {
+            return worker
+                .join()
+                .expect("HTTP probe thread panicked");
+        }
+
+        let last_success_ms = last_success.load(Ordering::Relaxed);
+        let elapsed = clock_start.elapsed();
+        if last_success_ms == 0 {
+            if elapsed >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "HTTP probe timed out",
+                ));
             }
+            thread::sleep(CHECK_CHILD_INTERVAL.min(timeout - elapsed));
+            continue;
         }
 
-        if !ready {
-            sd_notify::notify(&[NotifyState::Ready, NotifyState::Watchdog])?;
-            ready = true;
-        } else {
-            sd_notify::notify(&[NotifyState::Watchdog])?;
+        let probe_age = elapsed.saturating_sub(Duration::from_millis(last_success_ms - 1));
+        if probe_age >= max_probe_age {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP probe heartbeat expired",
+            ));
         }
 
-        while let Some(delay) = interval
-            .checked_sub(started.elapsed())
-            .filter(|delay| !delay.is_zero())
-        {
-            thread::sleep(delay.min(CHECK_CHILD_INTERVAL));
-            check_child(child)?;
+        if elapsed >= next_watchdog {
+            let states: &[_] = if next_watchdog.is_zero() {
+                &[NotifyState::Ready, NotifyState::Watchdog]
+            } else {
+                &[NotifyState::Watchdog]
+            };
+            sd_notify::notify(states)?;
+            next_watchdog = elapsed + watchdog_interval;
         }
+        let until_watchdog = next_watchdog.saturating_sub(clock_start.elapsed());
+        thread::sleep(CHECK_CHILD_INTERVAL.min(until_watchdog));
     }
 }
 
