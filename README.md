@@ -21,5 +21,8 @@ and set `WatchdogSec` to enable the watchdog. The first successful probe trigger
 interval while the latest successful probe is less than one period plus one
 second old.
 
-A failed probe, stale probe result, or notification error causes the wrapper to
-kill the child and exit with status 1. Any child exit also fails the wrapper.
+A failed probe leaves the last successful probe time unchanged. The startup
+deadline is the longer of the request timeout and one period plus one second.
+If no probe succeeds by that deadline, the last success becomes stale, or a
+notification fails, the wrapper kills the child and exits with status 1. Any
+child exit also fails the wrapper.

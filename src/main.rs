@@ -14,21 +14,15 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn probe(agent: &ureq::Agent, url: &str) -> io::Result<()> {
-    let response = agent
+fn probe(agent: &ureq::Agent, url: &str) -> bool {
+    agent
         .get(url)
         .version(Version::HTTP_10)
         .header("Connection", "close")
         .call()
-        .map_err(io::Error::other)?;
-    if response.version() == Version::HTTP_10 && response.status() == StatusCode::OK {
-        return Ok(());
-    }
-    Err(io::Error::other(format!(
-        "unexpected HTTP response {:?} {}",
-        response.version(),
-        response.status()
-    )))
+        .is_ok_and(|response| {
+            response.version() == Version::HTTP_10 && response.status() == StatusCode::OK
+        })
 }
 
 fn check_child(child: &mut Child) -> io::Result<()> {
@@ -48,7 +42,7 @@ fn supervise(
     // Store elapsed milliseconds plus one, with zero reserved for startup.
     let last_success = Arc::new(AtomicU64::new(0));
     let heartbeat = Arc::clone(&last_success);
-    let worker = thread::Builder::new().spawn(move || -> io::Result<()> {
+    let worker = thread::Builder::new().spawn(move || {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .proxy(None)
             .max_idle_connections(0)
@@ -59,16 +53,18 @@ fn supervise(
             .into();
         loop {
             let started = Instant::now();
-            probe(&agent, &url)?;
-            heartbeat.store(
-                clock_start.elapsed().as_millis() as u64 + 1,
-                Ordering::Relaxed,
-            );
+            if probe(&agent, &url) {
+                heartbeat.store(
+                    clock_start.elapsed().as_millis() as u64 + 1,
+                    Ordering::Relaxed,
+                );
+            }
             thread::sleep(interval.saturating_sub(started.elapsed()));
         }
     })?;
 
     let max_probe_age = interval + Duration::from_secs(1);
+    let startup_timeout = max_probe_age.max(timeout);
     let watchdog_interval = sd_notify::watchdog_enabled()
         .filter(|timeout| !timeout.is_zero())
         .map_or(interval, |timeout| timeout / 2);
@@ -76,21 +72,19 @@ fn supervise(
     loop {
         check_child(child)?;
         if worker.is_finished() {
-            return worker
-                .join()
-                .expect("HTTP probe thread panicked");
+            return Err(io::Error::other("HTTP probe thread stopped"));
         }
 
         let last_success_ms = last_success.load(Ordering::Relaxed);
         let elapsed = clock_start.elapsed();
         if last_success_ms == 0 {
-            if elapsed >= timeout {
+            if elapsed >= startup_timeout {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "HTTP probe timed out",
+                    "no successful HTTP probe before startup deadline",
                 ));
             }
-            thread::sleep(CHECK_CHILD_INTERVAL.min(timeout - elapsed));
+            thread::sleep(CHECK_CHILD_INTERVAL.min(startup_timeout - elapsed));
             continue;
         }
 
